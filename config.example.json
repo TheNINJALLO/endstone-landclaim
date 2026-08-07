@@ -1,0 +1,11 @@
+{
+  "notification_type": "toast",
+  "dashboard_enabled": false,
+  "dashboard_port": 25590,
+  "dashboard_host": "127.0.0.1",
+  "discord_client_id": "",
+  "discord_client_secret": "",
+  "discord_redirect_uri": "",
+  "allowed_discord_ids": [],
+  "master_password": ""
+}

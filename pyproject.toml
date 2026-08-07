@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "endstone-landclaim"
+version = "10.0.5"
+description = "Admin land-claim manager with protections, allowed lists, and nested toasts for Endstone BDS."
+requires-python = ">=3.10"
+dependencies = [
+    "endstone>=0.11.8,<0.12",
+    "flask>=2.3.0",
+    "flask-cors>=4.0.0",
+    "requests>=2.31.0",
+]
+
+# This tells Endstone what to load
+[project.entry-points."endstone"]
+landclaim = "endstone_landclaim:AdminLandClaims"
+
+# This tells the build tool what to package
+[tool.hatch.build.targets.wheel]
+packages = ["src/endstone_landclaim"]
