@@ -20,8 +20,9 @@
 </p>
 
 <p align="center">
-  <a href="#overview">Overview</a> &bull;
-  <a href="#compatibility">Compatibility</a> &bull;
+  <a href="#what-it-does">What it does</a> &bull;
+  <a href="#how-to-use">How to use</a> &bull;
+  <a href="#commands-and-permissions">Commands</a> &bull;
   <a href="#install">Install</a> &bull;
   <a href="https://github.com/TheNINJALLO/endstone-landclaim/releases">Releases</a>
 </p>
@@ -30,11 +31,27 @@
 
 Admin land-claim manager with protections, allowed lists, and nested toasts for Endstone BDS. This release is aligned with Endstone 0.11.8 and Minecraft Bedrock Dedicated Server 1.26.40, and is distributed as a Python wheel for direct installation in an Endstone server.
 
-## Capabilities
+## What it does
 
-- Administrative land-claim creation and management
-- Protection rules with per-claim allow lists
-- Clear nested toast feedback for players and staff
+- Creates persistent administrative land claims with per-claim protection rules and allowed-player lists.
+- Controls block, interaction, PvP, entity, particle, and mob behavior inside configured boundaries.
+- Provides player request forms, staff management forms, notifications, and optional dashboard integration.
+
+## How to use
+
+1. Start once and review the generated local configuration; keep dashboard credentials and OAuth values out of Git.
+2. Grant `adminlandclaims.command` to claim managers, then use `/landclaim` to create and manage protected areas.
+3. Use `/requestclaim` for the request workflow and `adminlandclaims.bypass` only for trusted staff.
+4. Keep the dashboard disabled unless configured securely, and bind/reverse-proxy it according to your network policy.
+
+## Commands and permissions
+
+| Command / usage | What it does | Access |
+|---|---|---|
+| `/landclaim` | Opens the land claim management UI. | `adminlandclaims.command` |
+| `/requestclaim` | Request a new land claim. | `adminlandclaims.command` |
+| `/lcadmin`<br>`/lcadmin notification <toast\|tip\|chat>` | Admin commands for land claim settings. | `adminlandclaims.admin` |
+| `/lcdebug`<br>`/lcdebug <particles\|claims\|mobs\|killmobs\|forceparticles\|scanmobs\|countmobs>`<br>`/lcdebug testmob <mobtype>` | Debug commands for land claim testing. | `adminlandclaims.admin` |
 
 ## Compatibility
 
