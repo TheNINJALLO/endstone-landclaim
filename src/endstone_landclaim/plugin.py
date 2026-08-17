@@ -288,7 +288,7 @@ class LandClaimListener:
 class AdminLandClaims(Plugin):
     api_version = "0.11"
     
-    version = "10.0.4"  # Fixed config overwrite on disable
+    version = "10.0.6"  # Fixed config overwrite on disable
 
     commands = {
         "landclaim": {"description": "Opens the land claim management UI.", "permission": "adminlandclaims.command"},
