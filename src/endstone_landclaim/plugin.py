@@ -8,15 +8,17 @@
 # ensures correct registration.
 
 import json
+import math
 import os
 import time
 import uuid
 import threading
 import sqlite3
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from endstone import ColorFormat, Player
+from endstone.actor import Mob
 from endstone.command import Command, CommandSender
 from endstone.event import (
     event_handler,
@@ -27,7 +29,6 @@ from endstone.event import (
     PlayerInteractEvent,
     PlayerMoveEvent,
     ActorSpawnEvent,
-    ActorDeathEvent,
     PlayerJoinEvent,
 )
 from endstone.form import ActionForm, ModalForm, MessageForm, TextInput, Dropdown, Toggle
@@ -85,14 +86,16 @@ class Claim:
         if dim != self.dimension:
             return False
         minx, maxx, minz, maxz = self.bounds_xz()
-        return (minx <= int(x) <= maxx) and (minz <= int(z) <= maxz)
+        block_x, block_z = math.floor(x), math.floor(z)
+        return (minx <= block_x <= maxx) and (minz <= block_z <= maxz)
 
     def contains_3d(self, x: float, y: float, z: float, dim: str) -> bool:
         """Checks if (x, y, z, dim) is inside this claim."""
         if dim != self.dimension:
             return False
         minx, maxx, miny, maxy, minz, maxz = self.bounds_xyz()
-        return (minx <= int(x) <= maxx) and (miny <= int(y) <= maxy) and (minz <= int(z) <= maxz)
+        block_x, block_y, block_z = math.floor(x), math.floor(y), math.floor(z)
+        return (minx <= block_x <= maxx) and (miny <= block_y <= maxy) and (minz <= block_z <= maxz)
 
     def area(self) -> int:
         """Total area in blocks."""
@@ -114,14 +117,11 @@ class Claim:
         if self.dimension != other.dimension:
             return float('inf')
 
-        # Get centers of both claims
-        self_center = self.center_xz()
-        other_center = other.center_xz()
-
-        # Calculate distance between centers
-        dx = self_center[0] - other_center[0]
-        dz = self_center[1] - other_center[1]
-        return (dx * dx + dz * dz) ** 0.5
+        self_min_x, self_max_x, self_min_z, self_max_z = self.bounds_xz()
+        other_min_x, other_max_x, other_min_z, other_max_z = other.bounds_xz()
+        dx = max(other_min_x - self_max_x, self_min_x - other_max_x, 0)
+        dz = max(other_min_z - self_max_z, self_min_z - other_max_z, 0)
+        return math.hypot(dx, dz)
 
 
 @dataclass
@@ -154,10 +154,6 @@ class LandClaimListener:
 
     def __init__(self, plugin: "AdminLandClaims"):
         self.plugin = plugin
-        # Track spawned entities to prevent kill errors
-        self.spawned_entities = set()  # Set of entity IDs that have spawned
-
-
 
     @event_handler(priority=EventPriority.NORMAL, ignore_cancelled=True)
     def on_block_break(self, event: BlockBreakEvent):
@@ -230,38 +226,17 @@ class LandClaimListener:
         elif prev_name is not None:
             self.plugin._send_claim_notification(player, "Entering Wilderness", "Unclaimed land.")
 
-    @event_handler(priority=EventPriority.HIGH)
+    @event_handler(priority=EventPriority.HIGH, ignore_cancelled=True)
     def on_actor_spawn(self, event: ActorSpawnEvent):
-        """Track entity spawns for entity management."""
+        """Prevent configured mobs from entering the world inside a claim."""
         try:
             actor = event.actor
-            actor_id = str(actor.unique_id) if hasattr(actor, 'unique_id') else None
-
-            if actor_id:
-                self.spawned_entities.add(actor_id)
-
-            # Log actor spawns for debugging (only at debug level)
-            actor_type = type(actor).__name__
-            self.plugin.logger.debug(f"Actor spawned: {actor_type}")
-
-            # Note: Mob killing is now handled by periodic sweep task only
-            # This prevents command overload from spawn-event based killing
-
-        except Exception as e:
-            self.plugin.logger.error(f"Error in actor spawn handler: {e}")
-
-    @event_handler(priority=EventPriority.MONITOR)
-    def on_actor_death(self, event: ActorDeathEvent):
-        """Track entity deaths to clean up our tracking."""
-        try:
-            actor = event.actor
-            actor_id = str(actor.unique_id) if hasattr(actor, 'unique_id') else None
-
-            if actor_id and actor_id in self.spawned_entities:
-                self.spawned_entities.remove(actor_id)
-
-        except Exception as e:
-            self.plugin.logger.debug(f"Error in actor death handler: {e}")
+            if self.plugin._mob_cleanup_enabled and self.plugin._mob_cleanup_cancel_spawns:
+                claim = self.plugin._claim_containing_actor(actor)
+                if claim and self.plugin._should_kill_mob(actor, claim):
+                    event.cancel()
+        except Exception as exc:
+            self.plugin.logger.error(f"Error in actor spawn handler: {exc}")
 
     @event_handler(priority=EventPriority.NORMAL)
     def on_player_join(self, event: PlayerJoinEvent):
@@ -288,7 +263,7 @@ class LandClaimListener:
 class AdminLandClaims(Plugin):
     api_version = "0.11"
     
-    version = "10.0.6"  # Fixed config overwrite on disable
+    version = "10.0.7"  # Bounded, name-tag-aware mob control and stability fixes
 
     commands = {
         "landclaim": {"description": "Opens the land claim management UI.", "permission": "adminlandclaims.command"},
@@ -313,23 +288,29 @@ class AdminLandClaims(Plugin):
         self._player_name_mapping: Dict[str, Dict] = {}  # player_name -> {uuid, display_name, last_seen}
         self._web_server_thread: Optional[threading.Thread] = None
         
-        # Mob cleanup settings (periodic sweep)
-        self._mob_cleanup_index: int = 0  # Current position in small claims list
-        self._mob_large_claim_index: int = 0  # Current position in large claims list
-        self._mob_chunk_state: Dict[str, tuple] = {}  # claim_key -> (chunk_x, chunk_z)
-        self._mob_cleanup_interval: int = 20  # 20 ticks = 1 second between sweeps
-        self._max_kills_per_command: int = 25  # Max mobs per kill command
-        self._claims_per_cycle: int = 5  # Small claims to process per cycle
-        self._large_claim_threshold: int = 256 * 256  # 65536 blocks
-        self._chunk_size: int = 256  # Size of chunks for large claims
+        # Mob cleanup is based only on loaded actors; claim area is never iterated.
+        self._mob_cleanup_enabled: bool = True
+        self._mob_cleanup_cancel_spawns: bool = True
+        self._mob_cleanup_interval_ticks: int = 60
+        self._mob_cleanup_actors_per_tick: int = 200
+        self._mob_cleanup_max_removals_per_tick: int = 25
+        self._mob_cleanup_max_actor_snapshot: int = 20_000
+        self._mob_sweep_actors: Optional[List[object]] = None
+        self._mob_sweep_index: int = 0
+        self._mob_sweep_wait_ticks: int = 0
+        self._mob_sweep_removed: int = 0
+        self._mob_snapshot_offset: int = 0
+        self._mob_snapshot_limit_warned: bool = False
+        self._mob_sweep_claims_by_dimension: Dict[str, List[Claim]] = {}
         
         # Web dashboard configuration
         self._dashboard_enabled: bool = False
         self._dashboard_port: int = 25590
-        self._dashboard_host: str = "0.0.0.0"
+        self._dashboard_host: str = "127.0.0.1"
+        self._dashboard_public_url: str = "https://landclaim.oninetwork.com"
         self._discord_client_id: Optional[str] = None
         self._discord_client_secret: Optional[str] = None
-        self._discord_redirect_uri: Optional[str] = None
+        self._discord_redirect_uri: Optional[str] = "https://landclaim.oninetwork.com/auth/callback"
         self._allowed_discord_ids: List[str] = []
         self._master_password: str = ""  # Master password for dashboard login (empty = disabled)
         
@@ -370,6 +351,8 @@ class AdminLandClaims(Plugin):
         # Stop mob killer task
         if self._mob_killer_task_id is not None:
             self.server.scheduler.cancel_task(self._mob_killer_task_id)
+            self._mob_killer_task_id = None
+        self._reset_mob_sweep()
         # Stop the Flask web dashboard server cleanly
         try:
             from endstone_landclaim.web_dashboard.app import stop_server
@@ -405,6 +388,7 @@ class AdminLandClaims(Plugin):
     def _get_db_connection(self) -> sqlite3.Connection:
         """Get a database connection with WAL mode enabled."""
         conn = sqlite3.connect(self._sqlite_path, check_same_thread=False)
+        conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.row_factory = sqlite3.Row
         return conn
@@ -547,11 +531,14 @@ class AdminLandClaims(Plugin):
         return " ".join(name.split()).lower()
 
     def _reload_claims_from_disk(self):
-        """Reload claims from SQLite database into memory. Called by web dashboard callback.
-        
-        Note: This is called from the Flask thread. SQLite with WAL mode is thread-safe
-        for reads, and we're updating Python dicts which is safe for simple assignments.
-        """
+        """Queue a dashboard-requested claim reload on the server thread."""
+        try:
+            self.server.scheduler.run_task(self, self._reload_claims_on_main_thread)
+        except Exception as exc:
+            self.logger.error(f"[{self.name}] Failed to schedule claim reload: {exc}")
+
+    def _reload_claims_on_main_thread(self):
+        """Reload the in-memory claim map without racing server event handlers."""
         try:
             old_count = len(self._claims)
             self._load_claims()
@@ -561,11 +548,14 @@ class AdminLandClaims(Plugin):
             self.logger.error(f"[{self.name}] Failed to reload claims: {e}")
 
     def _reload_config_from_disk(self):
-        """Reload config from disk into memory. Called by web dashboard callback.
-        
-        Note: This is called from the Flask thread. Reading JSON and updating
-        simple Python attributes is thread-safe for our use case.
-        """
+        """Queue a dashboard-requested configuration reload on the server thread."""
+        try:
+            self.server.scheduler.run_task(self, self._reload_config_on_main_thread)
+        except Exception as exc:
+            self.logger.error(f"[{self.name}] Failed to schedule config reload: {exc}")
+
+    def _reload_config_on_main_thread(self):
+        """Reload configuration without racing the periodic server tasks."""
         try:
             self._load_config()
             self.logger.info(f"[{self.name}] Hot-reloaded config from disk")
@@ -574,21 +564,19 @@ class AdminLandClaims(Plugin):
 
     def _load_claims(self):
         """Load claims from SQLite database into memory."""
-        self._claims.clear()
+        loaded_claims: Dict[str, Claim] = {}
         conn = self._get_db_connection()
         try:
-            cursor = conn.execute("SELECT * FROM claims")
-            for row in cursor.fetchall():
+            owners_by_claim: Dict[str, List[str]] = {}
+            for owner_row in conn.execute("SELECT claim_key, uuid FROM claim_owners"):
+                owners_by_claim.setdefault(owner_row["claim_key"], []).append(owner_row["uuid"])
+
+            pending_by_claim: Dict[str, List[str]] = {}
+            for pending_row in conn.execute("SELECT claim_key, player_name FROM pending_names"):
+                pending_by_claim.setdefault(pending_row["claim_key"], []).append(pending_row["player_name"])
+
+            for row in conn.execute("SELECT * FROM claims"):
                 key = row["key"]
-                
-                # Get owners
-                owners_cursor = conn.execute("SELECT uuid FROM claim_owners WHERE claim_key = ?", (key,))
-                allowed_uuids = [r["uuid"] for r in owners_cursor.fetchall()]
-                
-                # Get pending names
-                pending_cursor = conn.execute("SELECT player_name FROM pending_names WHERE claim_key = ?", (key,))
-                pending_names = [r["player_name"] for r in pending_cursor.fetchall()]
-                
                 flags = ClaimFlags(
                     block_break=bool(row["flags_block_break"]),
                     block_place=bool(row["flags_block_place"]),
@@ -604,13 +592,14 @@ class AdminLandClaims(Plugin):
                     dimension=row["dimension"],
                     x1=row["x1"], y1=row["y1"], z1=row["z1"],
                     x2=row["x2"], y2=row["y2"], z2=row["z2"],
-                    allowed_uuids=allowed_uuids,
+                    allowed_uuids=owners_by_claim.get(key, []),
                     flags=flags,
                     parent_claim=row["parent_claim"],
                     is_child=bool(row["is_child"]),
-                    pending_names=pending_names
+                    pending_names=pending_by_claim.get(key, [])
                 )
-                self._claims[key] = claim
+                loaded_claims[key] = claim
+            self._claims = loaded_claims
         finally:
             conn.close()
 
@@ -661,30 +650,62 @@ class AdminLandClaims(Plugin):
         finally:
             conn.close()
 
+    def _delete_claim_records(self, claim_key: str):
+        """Delete one claim and its related rows in a single transaction."""
+        conn = self._get_db_connection()
+        try:
+            conn.execute("DELETE FROM claim_owners WHERE claim_key = ?", (claim_key,))
+            conn.execute("DELETE FROM pending_names WHERE claim_key = ?", (claim_key,))
+            conn.execute("DELETE FROM claims WHERE key = ?", (claim_key,))
+            conn.commit()
+        finally:
+            conn.close()
+
     def _load_config(self):
         """Loads plugin configuration from disk. Only overwrites defaults if file has actual values."""
         try:
             if os.path.exists(self._config_path):
-                with open(self._config_path, "r") as f:
+                with open(self._config_path, "r", encoding="utf-8") as f:
                     config = json.load(f)
                     self._notification_type = config.get("notification_type", self._notification_type)
-                    # Dashboard configuration - only overwrite if value exists and is not None
-                    if config.get("dashboard_enabled") is not None:
-                        self._dashboard_enabled = config["dashboard_enabled"]
-                    if config.get("dashboard_port") is not None:
-                        self._dashboard_port = config["dashboard_port"]
-                    if config.get("dashboard_host") is not None:
-                        self._dashboard_host = config["dashboard_host"]
-                    if config.get("discord_client_id"):
-                        self._discord_client_id = config["discord_client_id"]
-                    if config.get("discord_client_secret"):
-                        self._discord_client_secret = config["discord_client_secret"]
-                    if config.get("discord_redirect_uri"):
-                        self._discord_redirect_uri = config["discord_redirect_uri"]
-                    if config.get("allowed_discord_ids"):
-                        self._allowed_discord_ids = config["allowed_discord_ids"]
+                    if "dashboard_enabled" in config:
+                        self._dashboard_enabled = self._coerce_bool(config["dashboard_enabled"], self._dashboard_enabled)
+                    if "dashboard_port" in config:
+                        self._dashboard_port = self._clamp_int(config["dashboard_port"], self._dashboard_port, 1, 65535)
+                    for key, attribute in (
+                        ("dashboard_host", "_dashboard_host"),
+                        ("dashboard_public_url", "_dashboard_public_url"),
+                        ("discord_client_id", "_discord_client_id"),
+                        ("discord_client_secret", "_discord_client_secret"),
+                        ("discord_redirect_uri", "_discord_redirect_uri"),
+                    ):
+                        if key in config:
+                            setattr(self, attribute, config[key])
+                    if "allowed_discord_ids" in config:
+                        value = config["allowed_discord_ids"]
+                        self._allowed_discord_ids = [str(item) for item in value] if isinstance(value, list) else []
                     if "master_password" in config:
                         self._master_password = config["master_password"]
+                    if "mob_cleanup_enabled" in config:
+                        self._mob_cleanup_enabled = self._coerce_bool(config["mob_cleanup_enabled"], True)
+                    if "mob_cleanup_cancel_spawns" in config:
+                        self._mob_cleanup_cancel_spawns = self._coerce_bool(config["mob_cleanup_cancel_spawns"], True)
+                    self._mob_cleanup_interval_ticks = self._clamp_int(
+                        config.get("mob_cleanup_interval_ticks", self._mob_cleanup_interval_ticks),
+                        self._mob_cleanup_interval_ticks, 20, 1200
+                    )
+                    self._mob_cleanup_actors_per_tick = self._clamp_int(
+                        config.get("mob_cleanup_actors_per_tick", self._mob_cleanup_actors_per_tick),
+                        self._mob_cleanup_actors_per_tick, 10, 2000
+                    )
+                    self._mob_cleanup_max_removals_per_tick = self._clamp_int(
+                        config.get("mob_cleanup_max_removals_per_tick", self._mob_cleanup_max_removals_per_tick),
+                        self._mob_cleanup_max_removals_per_tick, 1, 200
+                    )
+                    self._mob_cleanup_max_actor_snapshot = self._clamp_int(
+                        config.get("mob_cleanup_max_actor_snapshot", self._mob_cleanup_max_actor_snapshot),
+                        self._mob_cleanup_max_actor_snapshot, 100, 100000
+                    )
             else:
                 # Create default config if it doesn't exist
                 self._save_config()
@@ -692,23 +713,57 @@ class AdminLandClaims(Plugin):
             self.logger.error(f"Failed to load config: {e}")
 
     def _save_config(self):
-        """Saves plugin configuration to disk."""
+        """Save known settings while preserving future or dashboard-only keys."""
         try:
-            config = {
+            config = {}
+            if os.path.exists(self._config_path):
+                with open(self._config_path, "r", encoding="utf-8") as config_file:
+                    existing = json.load(config_file)
+                    if isinstance(existing, dict):
+                        config.update(existing)
+            config.update({
                 "notification_type": self._notification_type,
                 "dashboard_enabled": self._dashboard_enabled,
                 "dashboard_port": self._dashboard_port,
                 "dashboard_host": self._dashboard_host,
+                "dashboard_public_url": self._dashboard_public_url,
                 "discord_client_id": self._discord_client_id,
                 "discord_client_secret": self._discord_client_secret,
                 "discord_redirect_uri": self._discord_redirect_uri,
                 "allowed_discord_ids": self._allowed_discord_ids,
-                "master_password": self._master_password
-            }
-            with open(self._config_path, "w") as f:
+                "master_password": self._master_password,
+                "mob_cleanup_enabled": self._mob_cleanup_enabled,
+                "mob_cleanup_cancel_spawns": self._mob_cleanup_cancel_spawns,
+                "mob_cleanup_interval_ticks": self._mob_cleanup_interval_ticks,
+                "mob_cleanup_actors_per_tick": self._mob_cleanup_actors_per_tick,
+                "mob_cleanup_max_removals_per_tick": self._mob_cleanup_max_removals_per_tick,
+                "mob_cleanup_max_actor_snapshot": self._mob_cleanup_max_actor_snapshot,
+            })
+            with open(self._config_path, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=2)
         except Exception as e:
             self.logger.error(f"Failed to save config: {e}")
+
+    @staticmethod
+    def _coerce_bool(value, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "yes", "on", "1"}:
+                return True
+            if normalized in {"false", "no", "off", "0"}:
+                return False
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return default
+
+    @staticmethod
+    def _clamp_int(value, default: int, minimum: int, maximum: int) -> int:
+        try:
+            return max(minimum, min(maximum, int(value)))
+        except (TypeError, ValueError):
+            return default
 
     @property
     def _player_mapping_path(self) -> str:
@@ -777,11 +832,12 @@ class AdminLandClaims(Plugin):
             
             # Debug log the config values
             self.logger.info(f"[{self.name}] OAuth Config - Client ID: {self._discord_client_id[:10] if self._discord_client_id else 'None'}...")
-            self.logger.info(f"[{self.name}] OAuth Config - Redirect URI: {self._discord_redirect_uri}")
+            self.logger.info(f"[{self.name}] Dashboard public URL: {self._dashboard_public_url}")
             
             # Configure the web dashboard with reload callback
             configure(
                 data_folder=self.data_folder,
+                public_url=self._dashboard_public_url,
                 discord_client_id=self._discord_client_id,
                 discord_client_secret=self._discord_client_secret,
                 discord_redirect_uri=self._discord_redirect_uri,
@@ -801,7 +857,8 @@ class AdminLandClaims(Plugin):
             self._web_server_thread = threading.Thread(target=start_server, daemon=True)
             self._web_server_thread.start()
             
-            self.logger.info(f"[{self.name}] Web dashboard started on http://{self._dashboard_host}:{self._dashboard_port}")
+            self.logger.info(f"[{self.name}] Web dashboard started: {self._dashboard_public_url}")
+            self.logger.info(f"[{self.name}] Dashboard backend listening on http://{self._dashboard_host}:{self._dashboard_port}")
             
         except ImportError as e:
             self.logger.warning(f"[{self.name}] Web dashboard not available: {e}")
@@ -877,12 +934,30 @@ class AdminLandClaims(Plugin):
             player.send_message(f"§e{title} §7- {content}")
 
     def _get_smallest_containing_claim(self, x: float, z: float, dim: str) -> Optional[Claim]:
-        candidates = [c for c in self._claims.values() if c.contains(x, z, dim)]
-        return min(candidates, key=lambda c: c.area()) if candidates else None
+        smallest = None
+        smallest_area = None
+        for claim in self._claims.values():
+            if claim.contains(x, z, dim):
+                area = claim.area()
+                if smallest_area is None or area < smallest_area:
+                    smallest, smallest_area = claim, area
+        return smallest
 
     def _get_smallest_containing_claim_3d(self, x: float, y: float, z: float, dim: str) -> Optional[Claim]:
-        candidates = [c for c in self._claims.values() if c.contains_3d(x, y, z, dim)]
-        return min(candidates, key=lambda c: c.volume()) if candidates else None
+        return self._get_smallest_containing_claim_3d_from(
+            self._claims.values(), x, y, z, dim
+        )
+
+    @staticmethod
+    def _get_smallest_containing_claim_3d_from(claims, x: float, y: float, z: float, dim: str) -> Optional[Claim]:
+        smallest = None
+        smallest_volume = None
+        for claim in claims:
+            if claim.contains_3d(x, y, z, dim):
+                volume = claim.volume()
+                if smallest_volume is None or volume < smallest_volume:
+                    smallest, smallest_volume = claim, volume
+        return smallest
 
     def _is_protected_action(self, player: Player, claim: Claim) -> bool:
         return (not player.has_permission("adminlandclaims.bypass")) and (self._player_uuid(player) not in claim.allowed_uuids)
@@ -896,6 +971,19 @@ class AdminLandClaims(Plugin):
         parent_key = self._normalize_claim_key(parent_name)
         return [c for c in self._claims.values() if c.parent_claim == parent_key]
 
+    @staticmethod
+    def _claim_is_inside_parent(child: Claim, parent: Claim) -> bool:
+        """Return whether every child boundary is inside its selected parent."""
+        if child.dimension != parent.dimension:
+            return False
+        child_bounds = child.bounds_xyz()
+        parent_bounds = parent.bounds_xyz()
+        return (
+            parent_bounds[0] <= child_bounds[0] <= child_bounds[1] <= parent_bounds[1]
+            and parent_bounds[2] <= child_bounds[2] <= child_bounds[3] <= parent_bounds[3]
+            and parent_bounds[4] <= child_bounds[4] <= child_bounds[5] <= parent_bounds[5]
+        )
+
     def _check_child_claim_proximity(self, new_claim: Claim) -> Tuple[bool, List[str], Optional[Tuple[int, int, int, int]]]:
         """
         Check if a child claim is too close to other child claims.
@@ -906,7 +994,11 @@ class AdminLandClaims(Plugin):
 
         conflicting_claims = []
         for claim in self._claims.values():
-            if claim.is_child and claim.name != new_claim.name and claim.dimension == new_claim.dimension:
+            if (
+                claim.is_child
+                and self._normalize_claim_key(claim.name) != self._normalize_claim_key(new_claim.name)
+                and claim.dimension == new_claim.dimension
+            ):
                 distance = new_claim.distance_to_claim(claim)
                 if distance < 150:
                     conflicting_claims.append(claim.name)
@@ -921,73 +1013,36 @@ class AdminLandClaims(Plugin):
         return len(conflicting_claims) > 0, conflicting_claims, suggested_coords
 
     def _should_kill_mob(self, actor, claim: Claim) -> bool:
-        """Determines if a mob should be killed based on claim settings."""
+        """Return whether a non-player mob is covered by this claim's flags."""
+        if not isinstance(actor, Mob) or isinstance(actor, Player):
+            return False
+        flags = claim.flags
+        if not (flags.kill_passive_mobs or flags.kill_hostile_mobs):
+            return False
+        if flags.ignore_named_mobs and self._actor_has_custom_name(actor):
+            return False
+        if flags.kill_passive_mobs and flags.kill_hostile_mobs:
+            return True
+        mob_type = self._get_mob_type(actor)
+        return (
+            (flags.kill_hostile_mobs and self._is_hostile_mob(mob_type))
+            or (flags.kill_passive_mobs and self._is_passive_mob(mob_type))
+        )
+
+    @staticmethod
+    def _actor_has_custom_name(actor) -> bool:
         try:
-            # Check if mob killing is enabled for this claim
-            if not (claim.flags.kill_passive_mobs or claim.flags.kill_hostile_mobs):
-                self.logger.debug(f"Mob killing disabled for claim {claim.name}")
-                return False
-
-            # Check if mob has a custom name and we should ignore named mobs
-            if claim.flags.ignore_named_mobs:
-                try:
-                    if hasattr(actor, 'name_tag') and actor.name_tag and actor.name_tag.strip():
-                        self.logger.info(f"Ignoring named mob: {actor.name_tag}")
-                        return False
-                except:
-                    pass
-
-            # Get mob type
-            mob_type = self._get_mob_type(actor)
-            if not mob_type:
-                self.logger.debug(f"Could not determine mob type for {type(actor).__name__}")
-                return False
-
-            self.logger.debug(f"Checking mob type: {mob_type} in claim {claim.name}")
-
-            # Check if it's a hostile mob and we should kill hostile mobs
-            if claim.flags.kill_hostile_mobs and self._is_hostile_mob(mob_type):
-                self.logger.debug(f"Should kill hostile mob: {mob_type}")
-                return True
-
-            # Check if it's a passive mob and we should kill passive mobs
-            if claim.flags.kill_passive_mobs and self._is_passive_mob(mob_type):
-                self.logger.debug(f"Should kill passive mob: {mob_type}")
-                return True
-
-            self.logger.debug(f"Not killing mob type: {mob_type} (hostile: {self._is_hostile_mob(mob_type)}, passive: {self._is_passive_mob(mob_type)})")
+            return bool(actor.name_tag and actor.name_tag.strip())
+        except (AttributeError, TypeError):
             return False
 
-        except Exception as e:
-            self.logger.error(f"Error checking if mob should be killed: {e}")
-            return False
-
-    def _get_mob_type(self, actor) -> Optional[str]:
-        """Gets the mob type from an actor."""
+    @staticmethod
+    def _get_mob_type(actor) -> str:
+        """Return Endstone's canonical actor identifier without its namespace."""
         try:
-            mob_type = None
-
-            # Try different ways to get the mob type
-            if hasattr(actor, 'type_id'):
-                mob_type = actor.type_id.lower()
-            elif hasattr(actor, 'entity_type'):
-                mob_type = str(actor.entity_type).lower()
-            elif hasattr(actor, 'identifier'):
-                mob_type = actor.identifier.lower()
-            else:
-                mob_type = str(type(actor).__name__).lower()
-
-            if mob_type:
-                # Clean up the mob type
-                if 'minecraft:' in mob_type:
-                    mob_type = mob_type.replace('minecraft:', '')
-
-                # Remove common suffixes
-                mob_type = mob_type.replace('entity', '').replace('actor', '').strip('_')
-
-            return mob_type
-        except:
-            return None
+            return str(actor.type).strip().lower().split(":")[-1]
+        except (AttributeError, TypeError, ValueError):
+            return ""
 
     def _is_hostile_mob(self, mob_type: str) -> bool:
         """Checks if a mob type is hostile."""
@@ -995,20 +1050,15 @@ class AdminLandClaims(Plugin):
             return False
 
         hostile_mobs = {
-            "zombie", "skeleton", "creeper", "spider", "enderman", "witch",
-            "blaze", "ghast", "slime", "magma_cube", "wither_skeleton", "witherskeleton",
-            "stray", "husk", "phantom", "drowned", "pillager", "vindicator",
-            "evoker", "ravager", "vex", "guardian", "elder_guardian",
-            "shulker", "endermite", "silverfish", "cave_spider", "cavespider", "wither",
-            "ender_dragon", "enderdragon", "piglin_brute", "piglinbrute", "hoglin", "zoglin",
-            "mob"  # Generic hostile mob type
+            "blaze", "bogged", "breeze", "cave_spider", "creaking", "creeper",
+            "drowned", "elder_guardian", "ender_dragon", "enderman", "endermite",
+            "evocation_illager", "evoker", "ghast", "guardian", "hoglin", "husk",
+            "magma_cube", "phantom", "piglin_brute", "pillager", "ravager", "shulker",
+            "silverfish", "skeleton", "slime", "spider", "stray", "vex", "vindicator",
+            "warden", "witch", "wither", "wither_skeleton", "zoglin", "zombie",
+            "zombie_villager", "zombie_villager_v2",
         }
-
-        # Check for exact matches and partial matches
-        mob_type_clean = mob_type.lower().replace('_', '').replace(' ', '')
-        return (mob_type in hostile_mobs or
-                mob_type_clean in hostile_mobs or
-                any(hostile in mob_type for hostile in hostile_mobs))
+        return mob_type.strip().lower().split(":")[-1] in hostile_mobs
 
     def _is_passive_mob(self, mob_type: str) -> bool:
         """Checks if a mob type is passive."""
@@ -1016,119 +1066,38 @@ class AdminLandClaims(Plugin):
             return False
 
         passive_mobs = {
-            "cow", "pig", "sheep", "chicken", "rabbit", "horse", "donkey",
-            "mule", "llama", "cat", "wolf", "parrot", "ocelot", "bat",
-            "squid", "dolphin", "turtle", "panda", "fox", "bee", "goat",
-            "axolotl", "glow_squid", "glowsquid", "villager", "wandering_trader",
-            "wanderingtrader", "iron_golem", "irongolem", "snow_golem", "snowgolem",
-            "mooshroom", "polar_bear", "polarbear", "strider"
+            "allay", "armadillo", "axolotl", "bat", "bee", "camel", "cat", "chicken",
+            "cow", "dolphin", "donkey", "fox", "frog", "glow_squid", "goat",
+            "happy_ghast", "horse", "iron_golem", "llama", "mooshroom", "mule",
+            "ocelot", "panda", "parrot", "pig", "piglin", "polar_bear", "pufferfish",
+            "rabbit", "salmon", "sheep", "skeleton_horse", "sniffer", "snow_golem",
+            "squid", "strider", "tadpole", "tropical_fish", "tropicalfish", "turtle",
+            "villager", "villager_v2", "wandering_trader", "wolf", "zombie_horse",
+            "zombie_pigman",
         }
+        return mob_type.strip().lower().split(":")[-1] in passive_mobs
 
-        # Check for exact matches and partial matches
-        mob_type_clean = mob_type.lower().replace('_', '').replace(' ', '')
-        return (mob_type in passive_mobs or
-                mob_type_clean in passive_mobs or
-                any(passive in mob_type for passive in passive_mobs))
-
-    def _kill_specific_mob(self, actor, claim: Claim):
-        """Kills a specific mob if it still exists and is in the claim."""
+    def _claim_containing_actor(
+        self, actor, claims_by_dimension: Optional[Dict[str, List[Claim]]] = None
+    ) -> Optional[Claim]:
+        if not isinstance(actor, Mob) or isinstance(actor, Player):
+            return None
         try:
-            # Check if actor still exists and is in the claim
-            if not hasattr(actor, 'location'):
-                self.logger.info("Actor no longer has location - may have been removed")
-                return
-
-            loc = actor.location
-            dim = loc.dimension.name.lower() if hasattr(loc, 'dimension') else "overworld"
-            current_claim = self._get_smallest_containing_claim_3d(loc.x, loc.y, loc.z, dim)
-
-            if current_claim and current_claim.name == claim.name:
-                mob_type = self._get_mob_type(actor)
-                self.logger.info(f"Attempting to kill {mob_type} at {int(loc.x)}, {int(loc.y)}, {int(loc.z)} in claim {claim.name}")
-
-                # Try to remove the actor using different methods
-                killed = False
-
-                # Method 1: Direct removal
-                if hasattr(actor, 'remove'):
-                    try:
-                        actor.remove()
-                        killed = True
-                        self.logger.info(f"Successfully removed {mob_type} using remove()")
-                    except Exception as e:
-                        self.logger.info(f"Failed to remove {mob_type} using remove(): {e}")
-
-                # Method 2: Kill method
-                if not killed and hasattr(actor, 'kill'):
-                    try:
-                        actor.kill()
-                        killed = True
-                        self.logger.info(f"Successfully killed {mob_type} using kill()")
-                    except Exception as e:
-                        self.logger.info(f"Failed to kill {mob_type} using kill(): {e}")
-
-                # Method 3: Command fallback
-                if not killed:
-                    try:
-                        # Use a more targeted kill command
-                        x, y, z = int(loc.x), int(loc.y), int(loc.z)
-                        command = f"kill @e[type=!player,x={x},y={y},z={z},r=2,c=1]"
-                        self.server.dispatch_command(self.server.command_sender, command)
-                        self.logger.info(f"Executed kill command for {mob_type}: {command}")
-                        killed = True
-                    except Exception as e:
-                        self.logger.error(f"Failed to kill {mob_type} via command: {e}")
-
-                if not killed:
-                    self.logger.error(f"All kill methods failed for {mob_type}")
-            else:
-                self.logger.info(f"Mob moved out of claim {claim.name}, not killing")
-
-        except Exception as e:
-            self.logger.error(f"Error killing specific mob: {e}")
-
-
-
-    def _kill_mobs_in_region(self, claim: Claim, x1: int, z1: int, x2: int, z2: int):
-        """Kill mobs in a specific region using targeted commands."""
-        try:
-            # Normalize coordinates
-            min_x, max_x = min(x1, x2), max(x1, x2)
-            min_z, max_z = min(z1, z2), max(z1, z2)
-            min_y, max_y = claim.y1, claim.y2
-            
-            # Calculate center and dimensions for selector
-            cx = (min_x + max_x) // 2
-            cy = (min_y + max_y) // 2
-            cz = (min_z + max_z) // 2
-            dx = (max_x - min_x) // 2 + 1
-            dy = (max_y - min_y) // 2 + 1
-            dz = (max_z - min_z) // 2 + 1
-            
-            # Build kill commands based on claim settings
-            commands = []
-            
-            if claim.flags.kill_hostile_mobs and claim.flags.kill_passive_mobs:
-                # Kill all non-player entities (except named mobs if ignore_named_mobs is True)
-                commands.append(f"kill @e[type=!player,x={cx},y={cy},z={cz},dx={dx},dy={dy},dz={dz},c={self._max_kills_per_command}]")
-            elif claim.flags.kill_hostile_mobs:
-                # Kill hostile mobs using family=monster
-                commands.append(f"kill @e[family=monster,x={cx},y={cy},z={cz},dx={dx},dy={dy},dz={dz},c={self._max_kills_per_command}]")
-            elif claim.flags.kill_passive_mobs:
-                # Kill passive mobs - need to target specific families
-                # Bedrock uses families like: animal, fish, etc.
-                commands.append(f"kill @e[family=animal,x={cx},y={cy},z={cz},dx={dx},dy={dy},dz={dz},c={self._max_kills_per_command}]")
-                commands.append(f"kill @e[family=fish,x={cx},y={cy},z={cz},dx={dx},dy={dy},dz={dz},c={self._max_kills_per_command}]")
-            
-            # Execute commands
-            for command in commands:
-                try:
-                    self.server.dispatch_command(self.server.command_sender, command)
-                except Exception as e:
-                    self.logger.debug(f"Kill command failed (may have no targets): {e}")
-                    
-        except Exception as e:
-            self.logger.error(f"Error killing mobs in region: {e}")
+            location = actor.location
+            dimension = actor.dimension.name.lower()
+        except (AttributeError, RuntimeError):
+            return None
+        if claims_by_dimension is None:
+            return self._get_smallest_containing_claim_3d(
+                location.x, location.y, location.z, dimension
+            )
+        return self._get_smallest_containing_claim_3d_from(
+            claims_by_dimension.get(dimension, ()),
+            location.x,
+            location.y,
+            location.z,
+            dimension,
+        )
 
     # ------------------ Command Handler ------------------
     def on_command(self, sender: CommandSender, command: Command, args: List[str]) -> bool:
@@ -1322,21 +1291,17 @@ class AdminLandClaims(Plugin):
                 player.send_message(f"{ColorFormat.YELLOW}Counting entities in claim {claim.name}...")
                 player.send_message(f"{ColorFormat.GRAY}Bounds: x={min_x}-{max_x}, y={min_y}-{max_y}, z={min_z}-{max_z}")
 
-                # Try to count entities using testfor commands
                 try:
-                    # Count all entities
-                    all_cmd = f"testfor @e[x={min_x},y={min_y},z={min_z},dx={max_x-min_x},dy={max_y-min_y},dz={max_z-min_z}]"
-                    self.server.dispatch_command(self.server.command_sender, all_cmd)
-
-                    # Count hostile mobs
-                    hostile_cmd = f"testfor @e[family=monster,x={min_x},y={min_y},z={min_z},dx={max_x-min_x},dy={max_y-min_y},dz={max_z-min_z}]"
-                    self.server.dispatch_command(self.server.command_sender, hostile_cmd)
-
-                    # Count passive mobs
-                    passive_cmd = f"testfor @e[family=!monster,type=!player,x={min_x},y={min_y},z={min_z},dx={max_x-min_x},dy={max_y-min_y},dz={max_z-min_z}]"
-                    self.server.dispatch_command(self.server.command_sender, passive_cmd)
-
-                    player.send_message(f"{ColorFormat.GREEN}Entity count commands executed. Check server console for results.")
+                    counts = self._count_loaded_mobs_in_claim(claim)
+                    player.send_message(f"{ColorFormat.GREEN}Loaded mobs: {counts['all']}")
+                    player.send_message(
+                        f"{ColorFormat.GRAY}Hostile: {counts['hostile']}, "
+                        f"passive/neutral: {counts['passive']}, named: {counts['named']}"
+                    )
+                    if counts["truncated"]:
+                        player.send_message(
+                            f"{ColorFormat.YELLOW}Count capped at {counts['inspected']} loaded actors for safety."
+                        )
                 except Exception as e:
                     player.send_message(f"{ColorFormat.RED}Error counting entities: {e}")
             else:
@@ -1356,11 +1321,14 @@ class AdminLandClaims(Plugin):
 
     def _open_request_claim_form(self, player: Player):
         """Opens form for players to request a new claim."""
-        # Check if player already has 2 claims
         player_uuid = self._player_uuid(player)
         player_claims = [c for c in self._claims.values() if player_uuid in c.allowed_uuids]
-        if len(player_claims) >= 2:
-            player.send_message(f"{ColorFormat.RED}You already have the maximum of 2 claims. Delete one to request another.")
+        pending_requests = [
+            request for request in self._claim_requests.values()
+            if request.player_uuid == player_uuid and request.status == "pending"
+        ]
+        if len(player_claims) + len(pending_requests) >= 2:
+            player.send_message(f"{ColorFormat.RED}You already have two active claims or pending requests.")
             return
 
         form = ModalForm("Request New Claim", submit_button="Submit Request")
@@ -1432,8 +1400,28 @@ class AdminLandClaims(Plugin):
                 player.send_message(f"{ColorFormat.RED}Claim name cannot be empty.")
                 return
 
+            if x1 == x2 or y1 == y2 or z1 == z2:
+                player.send_message(f"{ColorFormat.RED}Invalid coordinates. Claims must have volume.")
+                return
+
+            active_claims = sum(
+                player_uuid in claim.allowed_uuids for claim in self._claims.values()
+            )
+            active_requests = sum(
+                request.player_uuid == player_uuid and request.status == "pending"
+                for request in self._claim_requests.values()
+            )
+            if active_claims + active_requests >= 2:
+                player.send_message(f"{ColorFormat.RED}You already have two active claims or pending requests.")
+                return
+
             # Check if claim name already exists
-            if self._normalize_claim_key(claim_name) in self._claims:
+            normalized_name = self._normalize_claim_key(claim_name)
+            if normalized_name in self._claims or any(
+                request.status == "pending"
+                and self._normalize_claim_key(request.claim_name) == normalized_name
+                for request in self._claim_requests.values()
+            ):
                 player.send_message(f"{ColorFormat.RED}A claim with that name already exists.")
                 return
 
@@ -1474,7 +1462,7 @@ class AdminLandClaims(Plugin):
             )
             self._claim_requests[request_id] = request
             self._save_claim_requests()
-            player.send_toast(title="§lRequest Submitted", content=f"§7Your claim request has been submitted for review.")
+            player.send_toast(title="§lRequest Submitted", content="§7Your claim request has been submitted for review.")
 
         except ValueError as e:
             player.send_message(f"{ColorFormat.RED}Invalid coordinates. Make sure all coordinates are whole numbers (including negative numbers like -64).")
@@ -1588,6 +1576,12 @@ class AdminLandClaims(Plugin):
     def _approve_claim_request(self, player: Player, request: ClaimRequest, protection_values: List[bool]):
         """Approves a claim request and creates the claim."""
         try:
+            claim_key = self._normalize_claim_key(request.claim_name)
+            if claim_key in self._claims:
+                player.send_message(
+                    f"{ColorFormat.RED}A claim named '{request.claim_name}' now exists; rename or deny this request."
+                )
+                return
             # Create the claim from the request
             new_claim = Claim(
                 name=request.claim_name,
@@ -1607,7 +1601,7 @@ class AdminLandClaims(Plugin):
             )
 
             # Add the claim
-            self._claims[self._normalize_claim_key(request.claim_name)] = new_claim
+            self._claims[claim_key] = new_claim
             self._save_claims()
 
             # Update request status
@@ -1710,6 +1704,8 @@ class AdminLandClaims(Plugin):
                         on_click=lambda p: self._toggle_flag(p, claim, "kill_passive_mobs"))
         form.add_button(f"Kill Hostile Mobs: {'§aEnabled' if flags.kill_hostile_mobs else '§7Disabled'}",
                         on_click=lambda p: self._toggle_flag(p, claim, "kill_hostile_mobs"))
+        form.add_button(f"Ignore Named Mobs: {'§aEnabled' if flags.ignore_named_mobs else '§7Disabled'}",
+                        on_click=lambda p: self._toggle_flag(p, claim, "ignore_named_mobs"))
 
         form.add_button("§cDelete Claim", on_click=lambda p: self._open_delete_confirm_form(p, claim))
         form.add_button("§7Back to Claim List", on_click=self._open_claim_list_menu)
@@ -1719,6 +1715,8 @@ class AdminLandClaims(Plugin):
         current_value = getattr(claim.flags, flag_name)
         setattr(claim.flags, flag_name, not current_value)
         self._save_claims()
+        if flag_name in {"kill_passive_mobs", "kill_hostile_mobs", "ignore_named_mobs"}:
+            self._request_mob_sweep()
         player.send_tip(f"{ColorFormat.GREEN}Updated {flag_name} for '{claim.name}'.")
         self._open_manage_claim_menu(player, claim)
 
@@ -1731,8 +1729,15 @@ class AdminLandClaims(Plugin):
     def _confirm_delete_claim(self, player: Player, claim: Claim):
         """Confirms and deletes a claim."""
         key = self._normalize_claim_key(claim.name)
+        child_claims = self._get_child_claims(claim.name)
+        if child_claims:
+            player.send_message(
+                f"{ColorFormat.RED}Delete or reassign the {len(child_claims)} child claim(s) first."
+            )
+            self._open_manage_claim_menu(player, claim)
+            return
+        self._delete_claim_records(key)
         self._claims.pop(key, None)
-        self._save_claims()
         player.send_toast(title="§lClaim Deleted", content=f"§7Removed §e{claim.name}§7.")
         self._open_claim_list_menu(player)
 
@@ -1896,10 +1901,12 @@ class AdminLandClaims(Plugin):
 
             # Get parent claim if this is a child
             parent_claim = None
+            selected_parent = None
             if is_child:
                 parent_claims = self._get_parent_claims()
                 if parent_claim_index > 0 and parent_claim_index <= len(parent_claims):
-                    parent_claim = self._normalize_claim_key(parent_claims[parent_claim_index - 1].name)
+                    selected_parent = parent_claims[parent_claim_index - 1]
+                    parent_claim = self._normalize_claim_key(selected_parent.name)
                 else:
                     player.send_message(f"{ColorFormat.RED}Invalid parent claim selection.")
                     return
@@ -1923,6 +1930,10 @@ class AdminLandClaims(Plugin):
                 parent_claim=parent_claim,
                 is_child=is_child
             )
+
+            if is_child and not self._claim_is_inside_parent(new_claim, selected_parent):
+                player.send_message(f"{ColorFormat.RED}A child claim must be fully inside its selected parent.")
+                return
 
             # Check proximity for child claims
             if is_child:
@@ -2164,12 +2175,14 @@ class AdminLandClaims(Plugin):
 
             # Get parent claim if this is a child
             parent_claim = None
+            selected_parent = None
             if is_child:
                 parent_claims = self._get_parent_claims()
                 # Filter out self from parent options
                 available_parents = [c for c in parent_claims if c.name != original_claim.name]
                 if parent_claim_index > 0 and parent_claim_index <= len(available_parents):
-                    parent_claim = self._normalize_claim_key(available_parents[parent_claim_index - 1].name)
+                    selected_parent = available_parents[parent_claim_index - 1]
+                    parent_claim = self._normalize_claim_key(selected_parent.name)
                 elif parent_claim_index > 0:
                     player.send_message(f"{ColorFormat.RED}Invalid parent claim selection.")
                     return
@@ -2194,6 +2207,10 @@ class AdminLandClaims(Plugin):
                 is_child=is_child
             )
 
+            if is_child and not self._claim_is_inside_parent(updated_claim, selected_parent):
+                player.send_message(f"{ColorFormat.RED}A child claim must be fully inside its selected parent.")
+                return
+
             # Check proximity for child claims (only if coordinates changed or became child)
             coords_changed = (x1 != original_claim.x1 or y1 != original_claim.y1 or z1 != original_claim.z1 or
                             x2 != original_claim.x2 or y2 != original_claim.y2 or z2 != original_claim.z2)
@@ -2202,29 +2219,10 @@ class AdminLandClaims(Plugin):
             if is_child and (coords_changed or became_child):
                 is_too_close, conflicting_claims, suggested_coords = self._check_child_claim_proximity(updated_claim)
                 if is_too_close:
-                    # Remove original claim temporarily for proximity check
-                    if old_key in self._claims:
-                        del self._claims[old_key]
                     self._show_edit_proximity_warning(player, original_claim, updated_claim, conflicting_claims, suggested_coords)
                     return
 
-            # Remove old claim entry if name changed
-            if new_key != old_key:
-                if old_key in self._claims:
-                    del self._claims[old_key]
-                # Also delete from database
-                conn = self._get_db_connection()
-                try:
-                    conn.execute("DELETE FROM claims WHERE key = ?", (old_key,))
-                    conn.execute("DELETE FROM claim_owners WHERE claim_key = ?", (old_key,))
-                    conn.execute("DELETE FROM pending_names WHERE claim_key = ?", (old_key,))
-                    conn.commit()
-                finally:
-                    conn.close()
-
-            # Save the updated claim
-            self._claims[new_key] = updated_claim
-            self._save_claims()
+            self._persist_edited_claim(original_claim, updated_claim)
 
             player.send_toast(
                 title="§lClaim Updated",
@@ -2266,15 +2264,7 @@ class AdminLandClaims(Plugin):
 
     def _save_edited_claim_override(self, player: Player, original_claim: Claim, updated_claim: Claim):
         """Saves the edited claim despite proximity warnings."""
-        old_key = self._normalize_claim_key(original_claim.name)
-        new_key = self._normalize_claim_key(updated_claim.name)
-
-        # Remove old claim entry if name changed
-        if new_key != old_key and old_key in self._claims:
-            del self._claims[old_key]
-
-        self._claims[new_key] = updated_claim
-        self._save_claims()
+        self._persist_edited_claim(original_claim, updated_claim)
 
         player.send_toast(
             title="§lClaim Updated",
@@ -2286,15 +2276,7 @@ class AdminLandClaims(Plugin):
         """Saves the edited claim using suggested coordinates."""
         updated_claim.x1, updated_claim.z1, updated_claim.x2, updated_claim.z2 = suggested_coords
 
-        old_key = self._normalize_claim_key(original_claim.name)
-        new_key = self._normalize_claim_key(updated_claim.name)
-
-        # Remove old claim entry if name changed
-        if new_key != old_key and old_key in self._claims:
-            del self._claims[old_key]
-
-        self._claims[new_key] = updated_claim
-        self._save_claims()
+        self._persist_edited_claim(original_claim, updated_claim)
 
         player.send_toast(
             title="§lClaim Updated",
@@ -2303,11 +2285,21 @@ class AdminLandClaims(Plugin):
         self._open_manage_claim_menu(player, updated_claim)
 
     def _restore_and_return_to_manage(self, player: Player, original_claim: Claim):
-        """Restores the original claim and returns to manage menu."""
-        old_key = self._normalize_claim_key(original_claim.name)
-        self._claims[old_key] = original_claim  # Restore original
-        self._save_claims()
+        """Return to the unchanged original claim after cancelling an edit."""
         self._open_manage_claim_menu(player, original_claim)
+
+    def _persist_edited_claim(self, original_claim: Claim, updated_claim: Claim):
+        """Persist an edit and clean up renamed keys and child references."""
+        old_key = self._normalize_claim_key(original_claim.name)
+        new_key = self._normalize_claim_key(updated_claim.name)
+        if new_key != old_key:
+            self._delete_claim_records(old_key)
+            self._claims.pop(old_key, None)
+            for claim in self._claims.values():
+                if claim.parent_claim == old_key:
+                    claim.parent_claim = new_key
+        self._claims[new_key] = updated_claim
+        self._save_claims()
 
     def _open_player_access_form(self, player: Player, claim: Claim):
         """Opens the player access management form."""
@@ -2418,9 +2410,9 @@ class AdminLandClaims(Plugin):
 
         form = ActionForm(f"Remove Player from {claim.name}", "Select a player to remove:")
 
-        for uuid in claim.allowed_uuids:
-            player_name = self._get_player_name_by_uuid(uuid)
-            form.add_button(f"§c{player_name}", on_click=lambda p, u=uuid: self._remove_player_from_claim(p, claim, u))
+        for player_id in claim.allowed_uuids:
+            player_name = self._get_player_name_by_uuid(player_id)
+            form.add_button(f"§c{player_name}", on_click=lambda p, u=player_id: self._remove_player_from_claim(p, claim, u))
 
         form.add_button("§7Cancel", on_click=lambda p: self._open_player_access_form(p, claim))
         player.send_form(form)
@@ -2501,9 +2493,14 @@ class AdminLandClaims(Plugin):
         if not (expanded_min_x <= player_x <= expanded_max_x and expanded_min_z <= player_z <= expanded_max_z):
             return False
 
-        # If player is inside the actual claim, they're near the boundary
+        # Inside a large claim, only render when near one of its four edges.
         if min_x <= player_x <= max_x and min_z <= player_z <= max_z:
-            return True
+            return min(
+                player_x - min_x,
+                max_x - player_x,
+                player_z - min_z,
+                max_z - player_z,
+            ) <= distance
 
         # If player is outside claim but within distance, check if they're actually near boundary
         # Calculate distance to nearest boundary edge
@@ -2568,14 +2565,14 @@ class AdminLandClaims(Plugin):
                                 player.spawn_particle(particle_name, x + 0.5, y + 1, z + 0.5)
                                 success = True
                                 break
-                            except Exception as e:
+                            except Exception:
                                 continue
 
                         if not success:
                             # Final fallback for protected areas
                             try:
                                 player.spawn_particle("minecraft:shriek_particle", x + 0.5, y + 1, z + 0.5)
-                            except Exception as e:
+                            except Exception:
                                 pass  # Silent fail
                     else:
                         # Green/happy particles for unprotected areas
@@ -2585,14 +2582,14 @@ class AdminLandClaims(Plugin):
                                 player.spawn_particle(particle_name, x + 0.5, y + 1, z + 0.5)
                                 success = True
                                 break
-                            except Exception as e:
+                            except Exception:
                                 continue
 
                         if not success:
                             # Final fallback for unprotected areas
                             try:
                                 player.spawn_particle("minecraft:happy_villager", x + 0.5, y + 1, z + 0.5)
-                            except Exception as e:
+                            except Exception:
                                 pass  # Silent fail
 
                     particles_spawned += 1
@@ -2608,190 +2605,171 @@ class AdminLandClaims(Plugin):
 
     # ------------------ Mob Killing System ------------------
     def _start_mob_killer_task(self):
-        """Starts the periodic task to clean up mob tracking data and kill mobs as backup."""
-        # Run every 3 seconds to clean up old entity tracking data and kill mobs that enter claims
+        """Start the one-tick budgeted loaded-actor cleanup worker."""
         task = self.server.scheduler.run_task(
-            self, self._periodic_mob_management, delay=60, period=60  # 60 ticks = 3 seconds
+            self, self._periodic_mob_management, delay=20, period=1
         )
         self._mob_killer_task_id = task.task_id
 
     def _periodic_mob_management(self):
-        """Periodic task to clean up entity tracking and kill mobs in claims."""
+        """Process a bounded number of loaded actors and removals each tick."""
         try:
-            # Keep a direct reference instead of relying on PluginManager internals.
-            if len(self._listener.spawned_entities) > 1000:
-                entities_list = list(self._listener.spawned_entities)
-                self._listener.spawned_entities = set(entities_list[-500:])
-                self.logger.debug("Cleaned up entity tracking data")
+            if not self._mob_cleanup_enabled:
+                self._reset_mob_sweep()
+                self._mob_sweep_wait_ticks = self._mob_cleanup_interval_ticks
+                return
 
-            # Kill mobs that are currently in claims (both spawned and wandered in)
-            self._scan_and_kill_mobs_in_claims()
+            if self._mob_sweep_actors is None:
+                if self._mob_sweep_wait_ticks > 0:
+                    self._mob_sweep_wait_ticks -= 1
+                    return
+                if not self._has_mob_control_claims():
+                    self._mob_sweep_wait_ticks = self._mob_cleanup_interval_ticks
+                    return
+                self._begin_mob_sweep()
+                if not self._mob_sweep_actors:
+                    self._finish_mob_sweep()
+                    return
 
-        except Exception as e:
-            self.logger.debug(f"Error in periodic mob management: {e}")
+            inspected = 0
+            removed_this_tick = 0
+            while (
+                self._mob_sweep_actors is not None
+                and self._mob_sweep_index < len(self._mob_sweep_actors)
+                and inspected < self._mob_cleanup_actors_per_tick
+                and removed_this_tick < self._mob_cleanup_max_removals_per_tick
+            ):
+                actor = self._mob_sweep_actors[self._mob_sweep_index]
+                self._mob_sweep_index += 1
+                inspected += 1
+                if self._remove_actor_if_managed(actor):
+                    removed_this_tick += 1
+                    self._mob_sweep_removed += 1
+
+            if self._mob_sweep_actors is not None and self._mob_sweep_index >= len(self._mob_sweep_actors):
+                self._finish_mob_sweep()
+        except Exception as exc:
+            self.logger.error(f"Error in periodic mob management: {exc}")
+            self._reset_mob_sweep()
+            self._mob_sweep_wait_ticks = self._mob_cleanup_interval_ticks
+
+    def _has_mob_control_claims(self) -> bool:
+        return any(
+            claim.flags.kill_passive_mobs or claim.flags.kill_hostile_mobs
+            for claim in self._claims.values()
+        )
+
+    def _begin_mob_sweep(self):
+        """Snapshot a fair, capped window of actors that are already loaded."""
+        actors = self.server.level.actors
+        total = len(actors)
+        limit = self._mob_cleanup_max_actor_snapshot
+        if total > limit:
+            start = self._mob_snapshot_offset % total
+            end = start + limit
+            if end <= total:
+                actors = actors[start:end]
+            else:
+                actors = actors[start:] + actors[:end - total]
+            self._mob_snapshot_offset = end % total
+            if not self._mob_snapshot_limit_warned:
+                self.logger.warning(
+                    f"Mob cleanup limited each sweep to {limit} of {total} loaded actors"
+                )
+                self._mob_snapshot_limit_warned = True
+        else:
+            self._mob_snapshot_offset = 0
+            self._mob_snapshot_limit_warned = False
+        claims_by_dimension: Dict[str, List[Claim]] = {}
+        for claim in self._claims.values():
+            claims_by_dimension.setdefault(claim.dimension, []).append(claim)
+        self._mob_sweep_claims_by_dimension = claims_by_dimension
+        self._mob_sweep_actors = actors
+        self._mob_sweep_index = 0
+        self._mob_sweep_removed = 0
+
+    def _finish_mob_sweep(self):
+        inspected = self._mob_sweep_index
+        removed = self._mob_sweep_removed
+        self._reset_mob_sweep()
+        self._mob_sweep_wait_ticks = self._mob_cleanup_interval_ticks
+        if removed:
+            self.logger.debug(
+                f"Mob cleanup inspected {inspected} loaded actors and removed {removed}"
+            )
+
+    def _reset_mob_sweep(self):
+        self._mob_sweep_actors = None
+        self._mob_sweep_index = 0
+        self._mob_sweep_removed = 0
+        self._mob_sweep_claims_by_dimension = {}
+
+    def _remove_actor_if_managed(self, actor) -> bool:
+        """Revalidate a loaded actor immediately before direct removal."""
+        if not isinstance(actor, Mob) or isinstance(actor, Player):
+            return False
+        try:
+            if not actor.is_valid or actor.is_dead:
+                return False
+            claim = self._claim_containing_actor(actor, self._mob_sweep_claims_by_dimension)
+            if not claim or not self._should_kill_mob(actor, claim):
+                return False
+            actor.remove()
+            return True
+        except Exception as exc:
+            self.logger.debug(f"Skipped stale mob during cleanup: {exc}")
+            return False
+
+    def _count_loaded_mobs_in_claim(self, claim: Claim) -> Dict[str, int]:
+        """Count a capped loaded-actor snapshot without running volume selectors."""
+        actors = self.server.level.actors
+        total = len(actors)
+        actors = actors[:self._mob_cleanup_max_actor_snapshot]
+        counts = {
+            "all": 0,
+            "hostile": 0,
+            "passive": 0,
+            "named": 0,
+            "inspected": len(actors),
+            "truncated": int(total > len(actors)),
+        }
+        for actor in actors:
+            if not isinstance(actor, Mob) or isinstance(actor, Player):
+                continue
+            try:
+                location = actor.location
+                dimension = actor.dimension.name.lower()
+            except (AttributeError, RuntimeError):
+                continue
+            if not claim.contains_3d(location.x, location.y, location.z, dimension):
+                continue
+            counts["all"] += 1
+            mob_type = self._get_mob_type(actor)
+            counts["hostile"] += int(self._is_hostile_mob(mob_type))
+            counts["passive"] += int(self._is_passive_mob(mob_type))
+            counts["named"] += int(self._actor_has_custom_name(actor))
+        return counts
+
+    def _request_mob_sweep(self):
+        """Ask the periodic worker to begin as soon as its current batch permits."""
+        self._mob_sweep_wait_ticks = 0
 
     def _scan_and_kill_mobs_in_claims(self):
-        """Scans all claims and kills mobs that are currently inside them (including those that wandered in)."""
-        try:
-            claims_with_mob_killing = [
-                claim for claim in self._claims.values()
-                if claim.flags.kill_passive_mobs or claim.flags.kill_hostile_mobs
-            ]
-
-            if not claims_with_mob_killing:
-                self.logger.debug("No claims with mob killing enabled")
-                return
-
-            self.logger.debug(f"Scanning {len(claims_with_mob_killing)} claims for mobs")
-
-            # Check each claim individually - don't require players to be nearby
-            for claim in claims_with_mob_killing:
-                try:
-                    self.logger.debug(f"Scanning claim {claim.name} for mobs")
-                    self._kill_mobs_in_specific_claim(claim)
-                except Exception as e:
-                    self.logger.error(f"Error scanning claim {claim.name}: {e}")
-
-        except Exception as e:
-            self.logger.error(f"Error in scan and kill mobs: {e}")
+        """Compatibility entry point for the debug command's safe sweep request."""
+        self._request_mob_sweep()
 
     def _kill_mobs_in_specific_claim(self, claim: Claim):
-        """Kills mobs in a specific claim, but only within chunks near players."""
-        try:
-            # Find players in this claim
-            players_in_claim = []
-            for player in self.server.online_players:
-                if self._player_dimension_name(player) == claim.dimension:
-                    if claim.contains(player.location.x, player.location.z, claim.dimension):
-                        players_in_claim.append(player)
-
-            # If no players in claim, don't kill mobs (prevents server crashes from large claims)
-            if not players_in_claim:
-                self.logger.debug(f"No players in claim {claim.name}, skipping mob killing")
-                return
-
-            self.logger.debug(f"Killing mobs in claim {claim.name} near {len(players_in_claim)} players")
-
-            # Kill mobs only within 2 chunks (32 blocks) of each player in the claim
-            CHUNK_RADIUS = 32  # 2 chunks = 32 blocks
-
-            for player in players_in_claim:
-                px, py, pz = int(player.location.x), int(player.location.y), int(player.location.z)
-
-                # Define kill radius around player
-                kill_min_x = px - CHUNK_RADIUS
-                kill_max_x = px + CHUNK_RADIUS
-                kill_min_y = max(py - CHUNK_RADIUS, min(claim.y1, claim.y2))
-                kill_max_y = min(py + CHUNK_RADIUS, max(claim.y1, claim.y2))
-                kill_min_z = pz - CHUNK_RADIUS
-                kill_max_z = pz + CHUNK_RADIUS
-
-                # Build kill command based on claim settings
-                commands_to_run = []
-
-                if claim.flags.kill_hostile_mobs and claim.flags.kill_passive_mobs:
-                    # Kill all mobs except players
-                    all_cmd = f"kill @e[type=!player,x={kill_min_x},y={kill_min_y},z={kill_min_z},dx={kill_max_x-kill_min_x},dy={kill_max_y-kill_min_y},dz={kill_max_z-kill_min_z}]"
-                    commands_to_run.append(("all mobs", all_cmd))
-                else:
-                    if claim.flags.kill_hostile_mobs:
-                        # Kill hostile mobs
-                        hostile_cmd = f"kill @e[family=monster,x={kill_min_x},y={kill_min_y},z={kill_min_z},dx={kill_max_x-kill_min_x},dy={kill_max_y-kill_min_y},dz={kill_max_z-kill_min_z}]"
-                        commands_to_run.append(("hostile mobs", hostile_cmd))
-
-                    if claim.flags.kill_passive_mobs:
-                        # Kill passive mobs (exclude players and hostile mobs)
-                        passive_cmd = f"kill @e[family=!monster,type=!player,x={kill_min_x},y={kill_min_y},z={kill_min_z},dx={kill_max_x-kill_min_x},dy={kill_max_y-kill_min_y},dz={kill_max_z-kill_min_z}]"
-                        commands_to_run.append(("passive mobs", passive_cmd))
-
-                # Execute commands
-                for mob_type, command in commands_to_run:
-                    try:
-                        self.logger.debug(f"Executing kill command for {mob_type} near player {player.name}")
-                        result = self.server.dispatch_command(self.server.command_sender, command)
-                        self.logger.debug(f"Command result: {result}")
-                    except Exception as e:
-                        self.logger.error(f"Failed to execute {mob_type} kill command: {e}")
-
-        except Exception as e:
-            self.logger.error(f"Error killing mobs in claim {claim.name}: {e}")
+        """Compatibility wrapper; all removals use the bounded loaded-actor worker."""
+        if claim.flags.kill_passive_mobs or claim.flags.kill_hostile_mobs:
+            self._request_mob_sweep()
 
     def _backup_mob_killing(self):
-        """Backup mob killing system using commands."""
-        try:
-            claims_with_mob_killing = [
-                claim for claim in self._claims.values()
-                if claim.flags.kill_passive_mobs or claim.flags.kill_hostile_mobs
-            ]
-
-            if not claims_with_mob_killing:
-                return
-
-            self.logger.debug(f"Running backup mob killing for {len(claims_with_mob_killing)} claims")
-
-            for claim in claims_with_mob_killing:
-                try:
-                    min_x, max_x, min_z, max_z = claim.bounds_xz()
-                    min_y, max_y = min(claim.y1, claim.y2), max(claim.y1, claim.y2)
-
-                    # Build kill command based on claim settings
-                    if claim.flags.kill_hostile_mobs and claim.flags.kill_passive_mobs:
-                        # Kill all mobs except players
-                        mob_selector = "@e[type=!player]"
-                    elif claim.flags.kill_hostile_mobs:
-                        # Kill only hostile mobs
-                        mob_selector = "@e[family=monster]"
-                    elif claim.flags.kill_passive_mobs:
-                        # Kill only passive mobs
-                        mob_selector = "@e[family=!monster,type=!player]"
-                    else:
-                        continue
-
-                    # Add position and dimension constraints
-                    command = f"kill {mob_selector}[x={min_x},y={min_y},z={min_z},dx={max_x-min_x},dy={max_y-min_y},dz={max_z-min_z}]"
-
-                    # Execute the command
-                    self.server.dispatch_command(self.server.command_sender, command)
-                    self.logger.debug(f"Executed backup mob kill command for claim {claim.name}: {command}")
-
-                except Exception as e:
-                    self.logger.debug(f"Error in backup mob killing for claim {claim.name}: {e}")
-
-        except Exception as e:
-            self.logger.debug(f"Error in backup mob killing system: {e}")
+        """Compatibility wrapper retained for existing integrations."""
+        self._request_mob_sweep()
 
     def _backup_mob_killing_single_claim(self, claim: Claim):
-        """Backup mob killing for a single claim."""
-        try:
-            if not (claim.flags.kill_passive_mobs or claim.flags.kill_hostile_mobs):
-                self.logger.info(f"Mob killing disabled for claim {claim.name}")
-                return
-
-            min_x, max_x, min_z, max_z = claim.bounds_xz()
-            min_y, max_y = min(claim.y1, claim.y2), max(claim.y1, claim.y2)
-
-            # Build kill command based on claim settings
-            if claim.flags.kill_hostile_mobs and claim.flags.kill_passive_mobs:
-                # Kill all mobs except players
-                mob_selector = "@e[type=!player]"
-            elif claim.flags.kill_hostile_mobs:
-                # Kill only hostile mobs
-                mob_selector = "@e[family=monster]"
-            elif claim.flags.kill_passive_mobs:
-                # Kill only passive mobs
-                mob_selector = "@e[family=!monster,type=!player]"
-            else:
-                return
-
-            # Add position and dimension constraints
-            command = f"kill {mob_selector}[x={min_x},y={min_y},z={min_z},dx={max_x-min_x},dy={max_y-min_y},dz={max_z-min_z}]"
-
-            # Execute the command
-            self.server.dispatch_command(self.server.command_sender, command)
-            self.logger.info(f"Executed manual mob kill command for claim {claim.name}: {command}")
-
-        except Exception as e:
-            self.logger.error(f"Error in manual mob killing for claim {claim.name}: {e}")
+        """Compatibility wrapper retained for the manual debug action."""
+        self._kill_mobs_in_specific_claim(claim)
 
 
 

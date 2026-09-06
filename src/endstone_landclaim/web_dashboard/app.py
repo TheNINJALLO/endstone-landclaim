@@ -2,18 +2,18 @@
 # This server is launched by the Endstone plugin on enable
 
 import json
+import hmac
 import os
-import shutil
 import threading
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 from functools import wraps
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 import secrets
+from urllib.parse import urlencode, urlsplit
 
-from flask import Flask, jsonify, request, redirect, session, send_from_directory, url_for
-from flask_cors import CORS
+from flask import Flask, jsonify, request, redirect, session, send_from_directory
 import requests
 
 # Get the absolute path to the static folder (bundled with the package)
@@ -22,12 +22,16 @@ _STATIC_FOLDER = os.path.join(_PACKAGE_DIR, 'static')
 
 app = Flask(__name__, static_folder=_STATIC_FOLDER, static_url_path='')
 app.secret_key = secrets.token_hex(32)
-CORS(app, supports_credentials=True)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+)
 
 # ---------------------------------------------------------
 # Configuration (set by plugin on startup)
 # ---------------------------------------------------------
 DATA_FOLDER = None  # Set by plugin
+PUBLIC_URL = "https://landclaim.oninetwork.com"
 DISCORD_CLIENT_ID = None
 DISCORD_CLIENT_SECRET = None
 DISCORD_REDIRECT_URI = None
@@ -66,6 +70,7 @@ def get_config_path():
 def get_db_connection():
     """Get a database connection with WAL mode enabled."""
     conn = sqlite3.connect(get_db_path(), check_same_thread=False)
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
     return conn
@@ -169,43 +174,66 @@ def get_pending_names_for_claim(claim_key: str) -> List[str]:
 # ---------------------------------------------------------
 # Authentication (Discord OAuth2 + Master Password)
 # ---------------------------------------------------------
+def get_oauth_redirect_uri():
+    """Return the one canonical callback URI registered with Discord."""
+    if DISCORD_REDIRECT_URI:
+        return DISCORD_REDIRECT_URI
+    return f"{PUBLIC_URL}/auth/callback"
+
+
+def discord_auth_is_configured():
+    """Discord login is available only when it can authenticate and authorize."""
+    return bool(
+        DISCORD_CLIENT_ID
+        and DISCORD_CLIENT_SECRET
+        and get_oauth_redirect_uri()
+        and ALLOWED_DISCORD_IDS
+    )
+
+
+def session_user_is_authorized(user):
+    """Apply the current authentication configuration to an existing session."""
+    if not user:
+        return False
+    if user.get('auth_method') == 'password':
+        return bool(MASTER_PASSWORD)
+    return discord_auth_is_configured() and str(user.get('id', '')) in ALLOWED_DISCORD_IDS
+
+
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         if 'user' not in session:
             return jsonify({"error": "Not authenticated"}), 401
         
-        user = session['user']
-        
-        # Password-authenticated users are always authorized
-        if user.get('auth_method') == 'password':
-            return f(*args, **kwargs)
-        
-        # Discord OAuth users must be in the allowed IDs list
-        if ALLOWED_DISCORD_IDS and user['id'] not in ALLOWED_DISCORD_IDS:
+        if not session_user_is_authorized(session['user']):
+            session.clear()
             return jsonify({"error": "Not authorized"}), 403
-            
+
         return f(*args, **kwargs)
     return decorated
 
 @app.route('/auth/login')
 def login():
     """Redirect to Discord OAuth"""
-    if not DISCORD_CLIENT_ID:
-        return jsonify({"error": "OAuth not configured"}), 500
+    if not discord_auth_is_configured():
+        return jsonify({
+            "error": "Discord authentication is not fully configured",
+            "required": ["discord_client_id", "discord_client_secret", "allowed_discord_ids"]
+        }), 503
     
     state = secrets.token_urlsafe(16)
     session['oauth_state'] = state
     
     params = {
         'client_id': DISCORD_CLIENT_ID,
-        'redirect_uri': DISCORD_REDIRECT_URI or url_for('callback', _external=True),
+        'redirect_uri': get_oauth_redirect_uri(),
         'response_type': 'code',
         'scope': 'identify',
         'state': state
     }
     
-    url = "https://discord.com/api/oauth2/authorize?" + "&".join(f"{k}={v}" for k, v in params.items())
+    url = "https://discord.com/api/oauth2/authorize?" + urlencode(params)
     return redirect(url)
 
 @app.route('/auth/password', methods=['POST'])
@@ -220,7 +248,7 @@ def password_login():
     if not provided:
         return jsonify({"error": "Password is required"}), 400
     
-    if provided != MASTER_PASSWORD:
+    if not hmac.compare_digest(str(provided), MASTER_PASSWORD):
         return jsonify({"error": "Invalid password"}), 401
     
     # Create a session for password-authenticated users
@@ -237,14 +265,20 @@ def password_login():
 def auth_info():
     """Return available authentication methods"""
     return jsonify({
-        'discord': bool(DISCORD_CLIENT_ID),
-        'password': bool(MASTER_PASSWORD)
+        'discord': discord_auth_is_configured(),
+        'password': bool(MASTER_PASSWORD),
+        'public_url': PUBLIC_URL
     })
 
 @app.route('/auth/callback')
 def callback():
     """Handle Discord OAuth callback"""
-    if request.args.get('state') != session.get('oauth_state'):
+    if not discord_auth_is_configured():
+        return jsonify({"error": "Discord authentication is not fully configured"}), 503
+
+    expected_state = session.pop('oauth_state', None)
+    provided_state = request.args.get('state', '')
+    if not expected_state or not hmac.compare_digest(provided_state, expected_state):
         return jsonify({"error": "Invalid state"}), 400
     
     code = request.args.get('code')
@@ -257,25 +291,38 @@ def callback():
         'client_secret': DISCORD_CLIENT_SECRET,
         'grant_type': 'authorization_code',
         'code': code,
-        'redirect_uri': DISCORD_REDIRECT_URI or url_for('callback', _external=True)
+        'redirect_uri': get_oauth_redirect_uri()
     }
     
-    resp = requests.post('https://discord.com/api/oauth2/token', data=data)
+    try:
+        resp = requests.post('https://discord.com/api/oauth2/token', data=data, timeout=10)
+    except requests.RequestException:
+        return jsonify({"error": "Discord token service is unavailable"}), 502
     if resp.status_code != 200:
         return jsonify({"error": "Failed to get token"}), 400
     
-    token = resp.json()['access_token']
+    token = resp.json().get('access_token')
+    if not token:
+        return jsonify({"error": "Discord did not return an access token"}), 400
     
     # Get user info
     headers = {'Authorization': f'Bearer {token}'}
-    user_resp = requests.get('https://discord.com/api/users/@me', headers=headers)
+    try:
+        user_resp = requests.get('https://discord.com/api/users/@me', headers=headers, timeout=10)
+    except requests.RequestException:
+        return jsonify({"error": "Discord user service is unavailable"}), 502
     if user_resp.status_code != 200:
         return jsonify({"error": "Failed to get user"}), 400
     
     user = user_resp.json()
+    user_id = str(user.get('id', ''))
+    if user_id not in ALLOWED_DISCORD_IDS:
+        session.clear()
+        return jsonify({"error": "This Discord account is not allowed to access the dashboard"}), 403
+
     session['user'] = {
-        'id': user['id'],
-        'username': user['username'],
+        'id': user_id,
+        'username': user.get('username', 'Discord user'),
         'avatar': user.get('avatar')
     }
     
@@ -291,6 +338,9 @@ def logout():
 def me():
     """Get current user"""
     if 'user' in session:
+        if not session_user_is_authorized(session['user']):
+            session.clear()
+            return jsonify(None)
         user = dict(session['user'])
         user['auth_method'] = user.get('auth_method', 'discord')
         return jsonify(user)
@@ -355,10 +405,25 @@ def list_claims():
 @login_required
 def create_claim():
     """Create a new claim in SQLite database"""
-    data = request.json
+    data = request.get_json(silent=True) or {}
     
-    if not data.get('name'):
+    if not str(data.get('name', '')).strip():
         return jsonify({"error": "Name is required"}), 400
+    try:
+        coordinates = {
+            axis: int(data.get(axis, default))
+            for axis, default in (
+                ('x1', 0), ('y1', -64), ('z1', 0),
+                ('x2', 0), ('y2', 320), ('z2', 0),
+            )
+        }
+        if any(
+            coordinates[first] == coordinates[second]
+            for first, second in (('x1', 'x2'), ('y1', 'y2'), ('z1', 'z2'))
+        ):
+            return jsonify({"error": "Claims must have volume on every axis"}), 400
+    except (TypeError, ValueError):
+        return jsonify({"error": "Coordinates must be whole numbers"}), 400
     
     key = normalize_claim_key(data['name'])
     conn = get_db_connection()
@@ -382,8 +447,8 @@ def create_claim():
             key,
             data['name'],
             data.get('dimension', 'overworld'),
-            int(data.get('x1', 0)), int(data.get('y1', -64)), int(data.get('z1', 0)),
-            int(data.get('x2', 0)), int(data.get('y2', 320)), int(data.get('z2', 0)),
+            coordinates['x1'], coordinates['y1'], coordinates['z1'],
+            coordinates['x2'], coordinates['y2'], coordinates['z2'],
             data.get('parent_claim'),
             1 if data.get('is_child', False) else 0,
             1 if flags.get('block_break', True) else 0,
@@ -466,12 +531,30 @@ def update_claim(name):
         if not old_row:
             return jsonify({"error": "Claim not found"}), 404
         
-        data = request.json
+        data = request.get_json(silent=True) or {}
         flags = data.get('flags', {})
+        if not isinstance(flags, dict):
+            return jsonify({"error": "Flags must be an object"}), 400
+        if not isinstance(flags, dict):
+            return jsonify({"error": "Flags must be an object"}), 400
         
         # Check if name is being changed
         new_name = data.get('name', old_row['name'])
+        if not str(new_name).strip():
+            return jsonify({"error": "Name is required"}), 400
         new_key = normalize_claim_key(new_name)
+        try:
+            updated_coordinates = {
+                axis: int(data.get(axis, old_row[axis]))
+                for axis in ('x1', 'y1', 'z1', 'x2', 'y2', 'z2')
+            }
+        except (TypeError, ValueError):
+            return jsonify({"error": "Coordinates must be whole numbers"}), 400
+        if any(
+            updated_coordinates[first] == updated_coordinates[second]
+            for first, second in (('x1', 'x2'), ('y1', 'y2'), ('z1', 'z2'))
+        ):
+            return jsonify({"error": "Claims must have volume on every axis"}), 400
         
         if new_key != old_key:
             # Name changed - need to delete old and insert new
@@ -493,8 +576,8 @@ def update_claim(name):
             ''', (
                 new_key, new_name,
                 data.get('dimension', old_row['dimension']),
-                data.get('x1', old_row['x1']), data.get('y1', old_row['y1']), data.get('z1', old_row['z1']),
-                data.get('x2', old_row['x2']), data.get('y2', old_row['y2']), data.get('z2', old_row['z2']),
+                updated_coordinates['x1'], updated_coordinates['y1'], updated_coordinates['z1'],
+                updated_coordinates['x2'], updated_coordinates['y2'], updated_coordinates['z2'],
                 data.get('parent_claim', old_row['parent_claim']),
                 1 if data.get('is_child', old_row['is_child']) else 0,
                 1 if flags.get('block_break', old_row['flags_block_break']) else 0,
@@ -509,6 +592,7 @@ def update_claim(name):
             # Migrate owners to new key
             conn.execute("UPDATE claim_owners SET claim_key = ? WHERE claim_key = ?", (new_key, old_key))
             conn.execute("UPDATE pending_names SET claim_key = ? WHERE claim_key = ?", (new_key, old_key))
+            conn.execute("UPDATE claims SET parent_claim = ? WHERE parent_claim = ?", (new_key, old_key))
         else:
             # No name change - just update fields
             conn.execute('''
@@ -526,17 +610,17 @@ def update_claim(name):
             ''', (
                 new_name,
                 data.get('dimension'),
-                data.get('x1'), data.get('y1'), data.get('z1'),
-                data.get('x2'), data.get('y2'), data.get('z2'),
-                data.get('parent_claim'),
-                1 if data.get('is_child', False) else 0,
-                1 if flags.get('block_break', True) else 0,
-                1 if flags.get('block_place', True) else 0,
-                1 if flags.get('interact', True) else 0,
-                1 if flags.get('perimeter_particles', True) else 0,
-                1 if flags.get('kill_passive_mobs', False) else 0,
-                1 if flags.get('kill_hostile_mobs', False) else 0,
-                1 if flags.get('ignore_named_mobs', True) else 0,
+                updated_coordinates['x1'], updated_coordinates['y1'], updated_coordinates['z1'],
+                updated_coordinates['x2'], updated_coordinates['y2'], updated_coordinates['z2'],
+                data.get('parent_claim', old_row['parent_claim']),
+                1 if data.get('is_child', old_row['is_child']) else 0,
+                1 if flags.get('block_break', old_row['flags_block_break']) else 0,
+                1 if flags.get('block_place', old_row['flags_block_place']) else 0,
+                1 if flags.get('interact', old_row['flags_interact']) else 0,
+                1 if flags.get('perimeter_particles', old_row['flags_perimeter_particles']) else 0,
+                1 if flags.get('kill_passive_mobs', old_row['flags_kill_passive_mobs']) else 0,
+                1 if flags.get('kill_hostile_mobs', old_row['flags_kill_hostile_mobs']) else 0,
+                1 if flags.get('ignore_named_mobs', old_row['flags_ignore_named_mobs']) else 0,
                 old_key
             ))
         
@@ -575,6 +659,11 @@ def delete_claim(name):
         cursor = conn.execute("SELECT key FROM claims WHERE key = ?", (key,))
         if not cursor.fetchone():
             return jsonify({"error": "Claim not found"}), 404
+        child_count = conn.execute(
+            "SELECT COUNT(*) FROM claims WHERE parent_claim = ?", (key,)
+        ).fetchone()[0]
+        if child_count:
+            return jsonify({"error": "Delete or reassign child claims first"}), 409
         
         conn.execute("DELETE FROM claims WHERE key = ?", (key,))
         conn.execute("DELETE FROM claim_owners WHERE claim_key = ?", (key,))
@@ -972,28 +1061,36 @@ def get_player_mapping():
 # ---------------------------------------------------------
 _server = None  # Reference to the Werkzeug server for clean shutdown
 
-def configure(data_folder, discord_client_id=None, discord_client_secret=None, 
+def configure(data_folder, public_url="https://landclaim.oninetwork.com",
+              discord_client_id=None, discord_client_secret=None,
               discord_redirect_uri=None, allowed_discord_ids=None, reload_callback=None,
               config_reload_callback=None, master_password=""):
     """Configure the web dashboard (called by plugin)"""
-    global DATA_FOLDER, DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET
+    global DATA_FOLDER, PUBLIC_URL, DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET
     global DISCORD_REDIRECT_URI, ALLOWED_DISCORD_IDS, PLUGIN_RELOAD_CALLBACK, PLUGIN_CONFIG_RELOAD_CALLBACK
     global MASTER_PASSWORD
     
     DATA_FOLDER = data_folder
+    normalized_public_url = (public_url or "https://landclaim.oninetwork.com").strip().rstrip('/')
+    parsed_public_url = urlsplit(normalized_public_url)
+    if parsed_public_url.scheme not in ('http', 'https') or not parsed_public_url.netloc:
+        raise ValueError("dashboard_public_url must be an absolute HTTP(S) URL")
+    PUBLIC_URL = normalized_public_url
     DISCORD_CLIENT_ID = discord_client_id
     DISCORD_CLIENT_SECRET = discord_client_secret
-    DISCORD_REDIRECT_URI = discord_redirect_uri
+    DISCORD_REDIRECT_URI = (discord_redirect_uri or f"{PUBLIC_URL}/auth/callback").strip()
     PLUGIN_RELOAD_CALLBACK = reload_callback
     PLUGIN_CONFIG_RELOAD_CALLBACK = config_reload_callback
-    MASTER_PASSWORD = master_password or ""
+    MASTER_PASSWORD = str(master_password or "")
     
-    if allowed_discord_ids:
-        ALLOWED_DISCORD_IDS = set(str(i) for i in allowed_discord_ids)
+    ALLOWED_DISCORD_IDS = {str(i).strip() for i in (allowed_discord_ids or []) if str(i).strip()}
+    app.config['SESSION_COOKIE_SECURE'] = parsed_public_url.scheme == 'https'
     
     print(f"[WebDashboard] Configured with data_folder: {DATA_FOLDER}")
     print(f"[WebDashboard] Database path: {get_db_path()}")
-    print(f"[WebDashboard] Auth methods: Discord={'YES' if discord_client_id else 'NO'}, Password={'YES' if MASTER_PASSWORD else 'NO'}")
+    print(f"[WebDashboard] Public URL: {PUBLIC_URL}")
+    print(f"[WebDashboard] OAuth callback: {get_oauth_redirect_uri()}")
+    print(f"[WebDashboard] Auth methods: Discord={'YES' if discord_auth_is_configured() else 'NO'}, Password={'YES' if MASTER_PASSWORD else 'NO'}")
     print(f"[WebDashboard] Reload callback: {'SET' if reload_callback else 'NOT SET'}")
     print(f"[WebDashboard] Config reload callback: {'SET' if config_reload_callback else 'NOT SET'}")
 

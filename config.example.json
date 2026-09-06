@@ -3,9 +3,16 @@
   "dashboard_enabled": false,
   "dashboard_port": 25590,
   "dashboard_host": "127.0.0.1",
+  "dashboard_public_url": "https://landclaim.oninetwork.com",
   "discord_client_id": "",
   "discord_client_secret": "",
-  "discord_redirect_uri": "",
+  "discord_redirect_uri": "https://landclaim.oninetwork.com/auth/callback",
   "allowed_discord_ids": [],
-  "master_password": ""
+  "master_password": "",
+  "mob_cleanup_enabled": true,
+  "mob_cleanup_cancel_spawns": true,
+  "mob_cleanup_interval_ticks": 60,
+  "mob_cleanup_actors_per_tick": 200,
+  "mob_cleanup_max_removals_per_tick": 25,
+  "mob_cleanup_max_actor_snapshot": 20000
 }

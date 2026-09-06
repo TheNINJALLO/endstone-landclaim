@@ -61,14 +61,14 @@ Admin land-claim manager with protections, allowed lists, and nested toasts for 
 | Endstone API | `0.11` |
 | Bedrock Dedicated Server | `1.26.44` |
 | Python | `>=3.10` |
-| Plugin release | `v10.0.6` |
+| Plugin release | `v10.0.7` |
 
 ## Install
 
 Download the wheel from the matching GitHub release:
 
 ```bash
-gh release download v10.0.6 --repo TheNINJALLO/endstone-landclaim --pattern "*.whl"
+gh release download v10.0.7 --repo TheNINJALLO/endstone-landclaim --pattern "*.whl"
 ```
 
 Copy the downloaded wheel into the server's `plugins/` directory, remove any older wheel for the same plugin, and restart Endstone.
@@ -87,4 +87,31 @@ Every `v*` tag runs [the wheel release workflow](.github/workflows/wheel-release
 
 ## Dashboard configuration
 
-Copy [`config.example.json`](config.example.json) into the plugin's generated data folder as `config.json`. Supply your own Discord application identifiers, OAuth client secret, redirect URI, allow list, and optional master password. Never commit the populated runtime file.
+The dashboard's public address is [https://landclaim.oninetwork.com](https://landclaim.oninetwork.com). The embedded server listens privately on `127.0.0.1:25590`; the public address must reverse-proxy to that listener and provide HTTPS.
+
+Copy [`config.example.json`](config.example.json) into the plugin's generated data folder as `config.json`, then configure Discord access:
+
+1. Create or select an application in the Discord Developer Portal.
+2. Under **OAuth2**, add exactly `https://landclaim.oninetwork.com/auth/callback` as a redirect URI.
+3. Put the application's client ID and client secret in `discord_client_id` and `discord_client_secret`.
+4. Add each approved person's Discord user ID to `allowed_discord_ids`. An empty list disables Discord login; it does not grant public access.
+5. Set `dashboard_enabled` to `true`, restart Endstone, and visit [https://landclaim.oninetwork.com](https://landclaim.oninetwork.com).
+
+`master_password` is an optional recovery login. Use a long, unique password or leave it empty to disable password access. Never commit the populated runtime file.
+
+The reverse proxy should terminate TLS and forward requests to `http://127.0.0.1:25590`. DNS, the TLS certificate, and the proxy/tunnel are deployment infrastructure and must point `landclaim.oninetwork.com` at the Endstone host.
+
+## Mob control and performance
+
+Enable **Kill Hostile Mobs** and/or **Kill Passive Mobs** on an individual claim to keep those mob groups out. Enable **Ignore Named Mobs** to preserve mobs with a non-empty custom name tag. Players are always excluded.
+
+Mob control cancels matching new spawns immediately and checks mobs that wander into a claim using a bounded loaded-actor sweep. It does not iterate every block in a claim or force-load chunks, so cleanup cost is independent of claim area. The defaults in [`config.example.json`](config.example.json) are conservative; operators can tune the sweep interval, actors inspected per tick, removals per tick, and maximum snapshot size without changing claim data.
+
+| Setting | Default | Purpose |
+|---|---:|---|
+| `mob_cleanup_enabled` | `true` | Enables spawn prevention and loaded-mob sweeps. |
+| `mob_cleanup_cancel_spawns` | `true` | Cancels matching mob spawns inside claims. |
+| `mob_cleanup_interval_ticks` | `60` | Delay between completed sweeps. |
+| `mob_cleanup_actors_per_tick` | `200` | Maximum loaded actors inspected in one server tick. |
+| `mob_cleanup_max_removals_per_tick` | `25` | Maximum mobs removed in one server tick. |
+| `mob_cleanup_max_actor_snapshot` | `20000` | Maximum loaded actors retained and inspected in one sweep. |
