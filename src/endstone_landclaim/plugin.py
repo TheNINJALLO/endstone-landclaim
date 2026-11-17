@@ -263,7 +263,7 @@ class LandClaimListener:
 class AdminLandClaims(Plugin):
     api_version = "0.11"
     
-    version = "10.0.7"  # Bounded, name-tag-aware mob control and stability fixes
+    version = "10.0.8"  # Bounded, name-tag-aware mob control and stability fixes
 
     commands = {
         "landclaim": {"description": "Opens the land claim management UI.", "permission": "adminlandclaims.command"},

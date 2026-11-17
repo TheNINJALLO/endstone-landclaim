@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "endstone-landclaim"
-version = "10.0.7"
+version = "10.0.8"
 description = "Admin land-claim manager with protections, allowed lists, and nested toasts for Endstone BDS."
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
-    "endstone>=0.11.9,<0.12",
+    "endstone>=0.11.16,<0.12",
     "flask>=2.3.0",
     "requests>=2.31.0",
 ]
